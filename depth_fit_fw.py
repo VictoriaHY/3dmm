@@ -27,6 +27,7 @@ from utils import get_device, get_mesh_renderer, get_points_renderer, unproject_
 
 import pickle
 
+import math
 import mcubes
 import zlib
 import struct
@@ -56,7 +57,7 @@ h = 360
 data_folder = '.'
 depth_path = data_folder + '/depth_2.xyz'
 video_path = data_folder + '/output_2.mov'
-output_video_path = data_folder + '/rgbd_2_wd2.mp4'
+output_video_path = data_folder + '/rgbd_2_score1.mp4'
 
 import wandb
 USE_WANDB = False
@@ -71,7 +72,7 @@ import torch.nn.functional as F
 #     return corres
 
 class Model(nn.Module):
-    def __init__(self, mean, pca, variance, renderer, key_ref, key_side_ref, key_keypoint, frame_num, ref_depth):
+    def __init__(self, mean, pca, variance, renderer, key_ref, key_side_ref, key_ref_s, key_side_ref_s, key_keypoint, frame_num, ref_depth):
         super().__init__()
         self.mean = mean
         self.pca = pca
@@ -92,6 +93,8 @@ class Model(nn.Module):
         # image_ref = torch.from_numpy((image_ref[..., :3].max(-1) != 1).astype(np.float32))
         self.key_ref = key_ref
         self.key_side_ref = key_side_ref
+        self.key_ref_s = key_ref_s
+        self.key_side_ref_s = key_side_ref_s
         # self.register_buffer('image_ref', image_ref)
         
         # Create an optimizable parameter for the x, y, z position of the camera. 
@@ -187,6 +190,7 @@ class Model(nn.Module):
         # T = -torch.bmm(R.transpose(1, 2), self.camera_position[:, :, None])[:, :, 0]   # (1, 3)
         # print(self.Compute_rotation_matrix(torch.tensor([[0,0,np.pi/3]])))
         R1 = self.Compute_rotation_matrix(self.R)
+        # print(R1.shape)
         T1 = self.T
 
         points = self.mean + (self.pca @ (self.param * torch.sqrt(self.variance)).reshape(-1,1)).reshape(-1,3)
@@ -206,8 +210,8 @@ class Model(nn.Module):
 
 
         
-        loss_k = torch.mean((points_k[:, self.inner, :] - self.key_ref) ** 2)
-        loss_k1 = torch.mean((points_k[:, self.side, :] - self.key_side_ref) ** 2)
+        loss_k = torch.mean(((points_k[:, self.inner, :] - self.key_ref) ** 2) * self.key_ref_s)
+        loss_k1 = torch.mean(((points_k[:, self.side, :] - self.key_side_ref) ** 2) * self.key_side_ref_s)
 
         # print(self.param.shape)
         loss_reg = torch.square(self.param).mean()
@@ -295,13 +299,17 @@ class Model(nn.Module):
             # print(pred_d.max())
             # print(pred_d.min())
             # if d>0:
-            loss_d = ((pred_d - self.ref_depth[b1:b2,:,:,0])**2)
+            ref = self.ref_depth[b1:b2,:,:,0]
+            loss_d = ((pred_d - ref)**2)
             # print(loss_d.max())
             # print('pred',pred_d[0,315:325, 175:185])
             # print('ref', ref_depth[0, 315:325, 175:185, 0])
             # print(loss_d[0, 315:325, 175:185])
             mask = (loss_d<d) & (loss_d>1e-6) & (pred_d>0)
-            
+            mask = mask.detach()
+            # print(pred_d[mask].shape)
+            # print(ref[mask].shape)
+            loss_d1 = torch.nn.HuberLoss(delta=math.sqrt(d)/2)(pred_d[mask], ref[mask])
             
             # d = torch.log(pred_d[mask]) - torch.log(self.ref_depth[b1:b2,:,:,:][mask])
             
@@ -310,14 +318,14 @@ class Model(nn.Module):
             
             # loss_d = loss_d.masked_fill(loss_d>1000, 0)
             
-            loss_d[(loss_d>d) | (pred_d<1e-5)] = 0
-            # print(loss_d.shape)
-            loss_d = (loss_d.sum(dim=(1,2))/(mask.sum(dim=(1,2))+1)).mean()
+            # loss_d[(loss_d>d) | (pred_d<1e-5)] = 0
+            # # print(loss_d.shape)
+            # loss_d = (loss_d.sum(dim=(1,2))/(mask.sum(dim=(1,2))+1)).mean()
         
             # print(loss_d)
         # loss = loss1 + 0.1*loss2
         # loss = self.criterion(points[:,:,:,0], self.key_ref)
-        return loss_k, loss_k1, loss_reg, loss_d, R1, T1, points_k, mask, pred_d
+        return loss_k, loss_k1, loss_reg, loss_d1, R1, T1, points_k, mask, pred_d
 
 def load_BFM_2019(fname="./model2017-1_bfm_nomouth.h5"):
 
@@ -559,6 +567,8 @@ def fit_point(
     key_keypoint=None,
     ref_keypoint=None,
     ref_keypoint_side=None,
+    ref_keypoint_score=None,
+    ref_keypoint_side_score=None,
     image_size=(640,360),
     background_color=(0, 0, 0),
     device=None,
@@ -575,7 +585,7 @@ def fit_point(
     pca_shape = torch.tensor(data['shape_pcaBasis'], dtype=torch.float32).to(device)
     variance_shape = torch.tensor(data['shape_pcaVariance'], dtype=torch.float32).to(device)
 
-    model = Model(mean_shape, pca_shape, variance_shape, renderer, key_ref=ref_keypoint, key_side_ref=ref_keypoint_side, key_keypoint=key_keypoint, frame_num=num, ref_depth=ref_depth).to(device)
+    model = Model(mean_shape, pca_shape, variance_shape, renderer, key_ref=ref_keypoint, key_side_ref=ref_keypoint_side, key_ref_s=ref_keypoint_score, key_side_ref_s=ref_keypoint_side_score, key_keypoint=key_keypoint, frame_num=num, ref_depth=ref_depth).to(device)
     optimizer = torch.optim.Adam([model.R, model.T], lr=0.1)
     # optimizer = torch.optim.SGD(model.parameters(), 10.0)
 
@@ -624,23 +634,23 @@ def fit_point(
         if i%100 ==0:
             flag=True
         optimizer.zero_grad()
-        if i>=1000 and i<1700:
+        if i>=1000 and i<1500:
             for batch in range(0, num, 120):
-                loss, loss1, reg_loss, loss_d, R, T, key, m, _ = model(d=400, b1=batch, b2=min(batch+120, num), update=flag)
-                l = 0.3*loss+ 10*reg_loss + loss_d/5+ 0.3*0.2*loss1
+                loss, loss1, reg_loss, loss_d, R, T, key, m, _ = model(d=900, b1=batch, b2=min(batch+120, num), update=flag)
+                l = 0.3*loss+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
                 l.backward()
                 optimizer.step()
-        elif i>=1700 and i<2100:
+        elif i>=1500 and i<2100:
             for batch in range(0, num, 120):
-                loss, loss1, reg_loss, loss_d, R, T, key, m, _ = model(d=200, b1=batch, b2=min(batch+120, num), update=flag)
-                l = 0.3*loss+ 10*reg_loss + loss_d/5+ 0.3*0.2*loss1
+                loss, loss1, reg_loss, loss_d, R, T, key, m, _ = model(d=400, b1=batch, b2=min(batch+120, num), update=flag)
+                l = 0.3*loss+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
                 l.backward()
                 optimizer.step()
         elif i>=2100:
             # if i%2==0 or i%2==1:
             for batch in range(0, num, 120):
-                loss,loss1, reg_loss, loss_d, R, T, key, m, _ = model(d=50, b1=batch, b2=min(batch+120, num), update=flag)
-                l = 0.3*loss+ 10*reg_loss + loss_d/3+ 0.3*0.2*loss1
+                loss,loss1, reg_loss, loss_d, R, T, key, m, _ = model(d=100, b1=batch, b2=min(batch+120, num), update=flag)
+                l = 0.3*loss+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
                 l.backward()
                 optimizer.step()
             # else:
@@ -650,7 +660,7 @@ def fit_point(
             #     optimizer.step()
         else:
             loss,loss1, reg_loss, loss_d, R, T, key, m, _ = model()
-            l = loss+ 10*reg_loss + 0.1*loss1
+            l = loss+ 5*reg_loss + 0.1*loss1
             l.backward()
             optimizer.step()
         
@@ -723,7 +733,7 @@ if __name__ == "__main__":
     # frameSize = (2 * 2160, 3840)
     # frameSize = (2 * 1080, 1920)
     # frameSize = (4 * 360, 640)
-    frameSize = (4 * 360, 640)
+    frameSize = (5 * 360, 640)
     
     K = torch.tensor([[436.16, 0, 320.08], [0, 436.16, 179.22], [0, 0, 1]], dtype=torch.float)
 
@@ -745,6 +755,8 @@ if __name__ == "__main__":
     open_pose_side = torch.tensor([0,1,2,3,4,5,6,7, 9,10,11,12,13,14,15,16])
     ref_keypoints = torch.zeros((num,open_pose.shape[0],2)).cuda()
     ref_keypoints_side = torch.zeros((num,open_pose_side.shape[0],2)).cuda()
+    ref_keypoints_score = torch.zeros((num,open_pose.shape[0],1)).cuda()
+    ref_keypoints_side_score = torch.zeros((num,open_pose_side.shape[0],1)).cuda()
     ref_depth = torch.zeros((num, 640, 360, 1), device = device, dtype=torch.float32)
    
 
@@ -774,13 +786,17 @@ if __name__ == "__main__":
                 # cur_keypoint = [float(i) for i in cur_keypoint]
                 cur_keypoint = torch.tensor(cur_keypoint)
                 # print(cur_keypoint.reshape(-1,3).shape)
-                cur_keypoint = cur_keypoint.reshape(-1,3)[:,:2]*360/1080
+                cur_keypoint = cur_keypoint.reshape(-1,3)
                 # ref_keypoints[iter,:,1] = cur_keypoint[:, 0]
                 # ref_keypoints[iter,:,0] = cur_keypoint[:, 1]
 
-                cur_keypoint = cur_keypoint.long()
+                ref_keypoints_score[iter,:,:] = cur_keypoint[open_pose,2:3]
+                ref_keypoints_side_score[iter,:,:] = cur_keypoint[open_pose_side,2:3]
+
+                cur_keypoint = (cur_keypoint[:,:2]*360/1080).long()
                 mask[iter,cur_keypoint[:,1],cur_keypoint[:,0]] = 1
                 ref_keypoints[iter,:,:] = cur_keypoint[open_pose,:2]
+                
                 ref_keypoints_side[iter,:,:] = cur_keypoint[open_pose_side,:2]
 
                 
@@ -805,18 +821,18 @@ if __name__ == "__main__":
         print('%d' % frame_num, end="\r")
     print("")
 
-    model, R, T, param = fit_point(data, key_keypoint, ref_keypoint=ref_keypoints, ref_keypoint_side=ref_keypoints_side, num=num, ref_depth = ref_depth)
+    model, R, T, param = fit_point(data, key_keypoint, ref_keypoint=ref_keypoints, ref_keypoint_side=ref_keypoints_side, ref_keypoint_score=ref_keypoints_score, ref_keypoint_side_score=ref_keypoints_side_score, num=num, ref_depth = ref_depth)
     # pos = pos.detach()
     param = param.detach()
 
-    _,_,_,_, R, T,  k, _, depth = model(d=0, b1=0, b2=min(50,num))
+    _,_,_,_, R, T,  k, _, _ = model()
     k = k.detach().long().cpu().numpy()
     R = R.detach()
     T = T.detach()
     #------------------------
     
     dic = {'R':R, 'T':T, 'param': param}
-    torch.save(dic, 'bfs.pth')
+    torch.save(dic, 'huber1.pth')
 
     
     # print(device)
@@ -845,7 +861,7 @@ if __name__ == "__main__":
     out = cv2.VideoWriter(output_video_path,cv2.VideoWriter_fourcc(*'avc1'), 30, frameSize)
     ref_keypoints = ref_keypoints.long().cpu().numpy()
     ref_keypoints_side = ref_keypoints_side.long().cpu().numpy()
-    depth = depth.detach().cpu()#.numpy()
+    # depth = depth.detach().cpu()#.numpy()
     ref_depth = ref_depth.cpu().numpy()
     for i in range(num):
         # print(R[i])
@@ -895,12 +911,14 @@ if __name__ == "__main__":
         # print('gt depth', (ref_depth[i]-50)/450*255)
         # ref_depth_i = (ref_depth[i]/450*255).broadcast_to((640,360,3)).numpy().astype('uint8')
         ref_depth_i = cv2.applyColorMap((ref_depth[i]/450*255).astype('uint8'), cv2.COLORMAP_JET)#.transpose(1,0,2)
+        dif_depth = np.absolute(ref_depth[i]-z[0]).clip(0, 100)
+        dif_depth = cv2.applyColorMap((dif_depth/100*255).astype('uint8'), cv2.COLORMAP_JET)
         # print(ref_depth_i.shape)
 
         # print(video[i].shape)
         # print(mesh.shape)
         # im_h = cv2.hconcat([video[i].astype('uint8'), kk.astype('uint8'),gt_k.astype('uint8'),mesh.astype('uint8')])
-        im_h = cv2.hconcat([video[i].astype('uint8'),mesh.astype('uint8'), depth_i.astype('uint8'), ref_depth_i.astype('uint8')])
+        im_h = cv2.hconcat([video[i].astype('uint8'),mesh.astype('uint8'), depth_i.astype('uint8'), ref_depth_i.astype('uint8'), dif_depth.astype('uint8')])
         out.write(im_h)
 
     out.release()
