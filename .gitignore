@@ -1,7 +1,10 @@
 __pycache__/
 bfs.pth
-data/
 *.swp
 *.swo
+data/depth.xyz
+data/*.mp4
+data/rgb.mov
+data/.DS_Store
 
 RobustVideoMatting/

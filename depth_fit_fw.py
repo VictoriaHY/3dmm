@@ -166,7 +166,7 @@ def render_mesh(
 
 epoch_1 = 4000
 #epoch_1 = 200
-epoch_2 = 1000
+epoch_2 = 2000
 #epoch_2 = 200
 def fit_point(
     data=None, 
@@ -540,6 +540,7 @@ if __name__ == "__main__":
         frame_total=frame_total, 
         ref_depth = ref_depth
     )
+    from IPython import embed;embed()
     # pos = pos.detach()
     param = param.detach()
 
