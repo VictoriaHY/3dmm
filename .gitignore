@@ -3,3 +3,5 @@ bfs.pth
 data/
 *.swp
 *.swo
+
+RobustVideoMatting/

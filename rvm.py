@@ -3,9 +3,9 @@ import numpy as np
 import os
 import sys
 import argparse
-import torch as th
+import torch
 
-from model import MattingNetwork
+from RobustVideoMatting.model import MattingNetwork
 
 def segment(in_vid_path):
     if not os.path.exists(in_vid_path):
@@ -13,7 +13,9 @@ def segment(in_vid_path):
         return
 
     model=MattingNetwork('resnet50').eval().cuda()
-    model.load_state_dict(th.load('rvm_resnet50.pth'))
+
+    pretrained_model_path = "RobustVideoMatting/rvm_resnet50.pth"
+    model.load_state_dict(torch.load(pretrained_model_path))
 
     in_vid = cv2.VideoCapture(in_vid_path)
     in_vid_height = int(in_vid.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -38,11 +40,11 @@ def segment(in_vid_path):
         # (in_vid_height*3, in_vid_width)
     )
 
-    bgr = th.tensor([.47, 1, .6]).view(3,1,1).cuda()
+    bgr = torch.tensor([.47, 1, .6]).view(3,1,1).cuda()
     rec=[None]*4
     downsample_ratio = 0.25
 
-    with th.no_grad():
+    with torch.no_grad():
         for frm_idx in range(1200):
             success, img = in_vid.read()
             if not success:
@@ -54,7 +56,7 @@ def segment(in_vid_path):
                 img = cv2.transpose(img)   
                 img = cv2.flip(img, 1)
                 src = np.copy(img).astype(np.float32)/255.0
-                src = th.tensor(src, dtype=th.float32).cuda()
+                src = torch.tensor(src, dtype=torch.float32).cuda()
                 src = src[None, ...].permute(0,3,1,2)
 
                 fgr, pha, *rec = model(src.cuda(), *rec, downsample_ratio)
@@ -106,4 +108,7 @@ def segment(in_vid_path):
         print("")
 
 if __name__ == "__main__":
-    segment('../../proj/output_2.mov')
+    video_path = "data/rgb.mov"
+    if len(sys.argv) > 1:
+        video_path = sys.argv[1]
+    segment(video_path)

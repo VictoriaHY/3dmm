@@ -1,7 +1,6 @@
 import json
 from weakref import ref
 import pandas as pd
-import h5py
 
 import cv2
 import os
@@ -20,7 +19,6 @@ from tqdm.auto import tqdm
 
 import pickle as pkl
 
-import zlib
 import struct
 import torch.nn as nn
 
@@ -28,7 +26,6 @@ import wandb
 USE_WANDB = False
 import torch.nn.functional as F
 
-from pytorch3d.io import load_obj
 
 from pytorch3d.renderer import (
     AlphaCompositor,
@@ -48,6 +45,12 @@ from utils import (
     unproject_depth_image
 )
 
+from loader import (
+    load_BFM_2019,
+    load_facewarehouse_bin,
+    load_depth
+)
+
 from model import Model
 
 model_bin_path = "face_warehouse/FaceMorphModel_199.bin"
@@ -64,93 +67,7 @@ h = 360
 data_folder = 'data'
 depth_path = path.join(data_folder ,'depth.xyz')
 video_path = path.join(data_folder , 'rgb.mov')
-output_video_path = path.join(data_folder , '/rgbd.mp4')
-
-def load_BFM_2019(fname="./model2017-1_bfm_nomouth.h5"):
-
-    with h5py.File(fname, 'r') as f:
-        shape_mean = f['shape']['model']['mean'][:]
-        shape_pcaBasis = f['shape']['model']['pcaBasis'][:]
-        shape_pcaVariance = f['shape']['model']['pcaVariance'][:]
-
-        expression_mean = f['expression']['model']['mean'][:]
-        expression_pcaBasis = f['expression']['model']['pcaBasis'][:]
-        expression_pcaVariance = f['expression']['model']['pcaVariance'][:]
-
-        color_mean = f['color']['model']['mean'][:]
-        color_pcaBasis = f['color']['model']['pcaBasis'][:]
-        color_pcaVariance = f['color']['model']['pcaVariance'][:]
-
-        faces = f['shape']['representer']['cells'][:].transpose(1,0)
-        faces = torch.tensor(faces)
-
-        print(shape_mean.shape)
-        print(shape_pcaBasis.shape)
-        print(shape_pcaVariance.shape)
-        print(faces.shape)
-
-        return {'shape_mean': shape_mean, 'shape_pcaBasis': shape_pcaBasis, 'shape_pcaVariance': shape_pcaVariance,
-            'expression_mean': expression_mean, 'expression_pcaBasis': expression_pcaBasis, 'expression_pcaVariance': expression_pcaVariance,
-            'color_mean': color_mean, 'color_pcaBasis': color_pcaBasis, 'color_pcaVariance': color_pcaVariance,
-            'face': faces}
-        # return {'verts': v_bfm, 'color': c_bfm, 'shape_coeffs': shape_coeffs, 'exp_coeffs': exp_coeffs, 'color_coeffs': color_coeffs}
-
-def load_facewarehouse_bin(bin_path, obj_path):
-    with open(bin_path, "rb") as f:
-        # Basic parameters
-        vecNum = struct.unpack("i", f.read(4))[0]
-        ptNum = struct.unpack("i", f.read(4))[0]
-
-        # Average face
-        mAvergPosList = []
-        for i in range(ptNum):
-            x,y,z = struct.unpack("fff", f.read(12))
-            mAvergPosList.append(np.array([x,y,z]))
-        mAvergPos = np.stack(mAvergPosList)
-        
-        # Eigen values
-        mEigenValList = []
-        for i in range(vecNum):
-            e = struct.unpack("f", f.read(4))[0]
-            mEigenValList.append(e)
-        mEigenVal = np.array(mEigenValList)
-
-        mPrinCompList = []
-        for i in range(vecNum):
-            prinComp = []
-            for j in range(ptNum):
-                x,y,z = struct.unpack("fff", f.read(12))
-                prinComp.append(np.array([x,y,z]))
-            prinComp = np.stack(prinComp)
-            mPrinCompList.append(prinComp)
-        mPrinCompList = np.array(mPrinCompList)
-        mPrinCompList = mPrinCompList.reshape(199,-1).transpose(1,0)
-
-        _, faces, _ = load_obj(obj_path)
-        faces = faces.verts_idx
-
-    return {'shape_mean': mAvergPos, 'shape_pcaBasis': mPrinCompList, 'shape_pcaVariance': mEigenVal,
-            'face': faces}
-
-
-def load_depth():
-    # Reading depth
-    with open(depth_path, 'rb') as f:
-        data = zlib.decompress(f.read(), -15)
-
-    FRAME_COUNT = int(len(data) / w / h / 2)
-
-    frames_in_meters = np.frombuffer(data, np.float16).reshape(FRAME_COUNT,h,w).copy()
-    frames_in_meters = np.nan_to_num(frames_in_meters, 0)
-    frames_in_mm = frames_in_meters * 1000.0
-
-    mask = np.ones(frames_in_mm.shape)
-    frames_in_mm[(frames_in_mm<100) + (frames_in_mm>450)] = 0
-    mask[(frames_in_mm<100) + (frames_in_mm>450)] = 0
-    imgs_depth = frames_in_mm.clip(100.0, 450.0)
-
-    return imgs_depth, mask
-
+output_video_path = path.join(data_folder , 'rgbd.mp4')
 
 def render_point(
     verts=None,
@@ -249,7 +166,7 @@ def render_mesh(
 
 epoch_1 = 4000
 #epoch_1 = 200
-epoch_2 = 2500
+epoch_2 = 1000
 #epoch_2 = 200
 def fit_point(
     data=None, 
@@ -472,7 +389,7 @@ if __name__ == "__main__":
     data = load_facewarehouse_bin(model_bin_path, obj_path)
     mask = torch.zeros((frame_total,height,width)).to(device)
     video = np.zeros((frame_total,height,width,3))
-    imgs_depth, _ = load_depth()
+    imgs_depth, _ = load_depth(depth_path, w, h)
     
     iter = 0
     # face_keypoints_order = torch.tensor([0, 1, 2, 3, 8, 13, 14, 15, 16, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 61, 62, 63, 65, 66, 67, 68, 69])
@@ -487,22 +404,25 @@ if __name__ == "__main__":
     leftear_keypoints_total = leftear_keypoints_indices.shape[0]
     rightear_keypoints_total = rightear_keypoints_indices.shape[0]
     
-    ref_face_keypoints = torch.zeros((frame_total,face_keypoints_total,2)).to(device)
-    ref_face_keypoints_side = torch.zeros((frame_total,side_face_keypoints_total,2)).to(device)
-    ref_face_keypoints_score = torch.zeros((frame_total,face_keypoints_total,1)).to(device)
-    ref_face_keypoints_side_score = torch.zeros((frame_total,side_face_keypoints_total,1)).to(device)
+    ref_face_keypoints = torch.zeros((frame_total,face_keypoints_total,2))
+    ref_face_keypoints_side = torch.zeros((frame_total,side_face_keypoints_total,2))
+    ref_face_keypoints_score = torch.zeros((frame_total,face_keypoints_total,1))
+    ref_face_keypoints_side_score = torch.zeros((frame_total,side_face_keypoints_total,1))
 
-    ref_leftear_keypoints = torch.zeros([frame_total, leftear_keypoints_total, 2]).to(device)
-    ref_leftear_keypoints_score = torch.zeros([frame_total, leftear_keypoints_total, 1]).to(device)
+    ref_leftear_keypoints = torch.zeros([frame_total, leftear_keypoints_total, 2])
+    ref_leftear_keypoints_score = torch.zeros([frame_total, leftear_keypoints_total, 1])
 
-    ref_rightear_keypoints = torch.zeros([frame_total, rightear_keypoints_total, 2]).to(device)
-    ref_rightear_keypoints_score = torch.zeros([frame_total, rightear_keypoints_total, 1]).to(device)
+    ref_rightear_keypoints = torch.zeros([frame_total, rightear_keypoints_total, 2])
+    ref_rightear_keypoints_score = torch.zeros([frame_total, rightear_keypoints_total, 1])
 
     ref_depth = torch.zeros((frame_total, height, width, 1), device = device, dtype=torch.float32)
 
     frame_sample_freq = 10
 
     ear_keypoints = pkl.load(open(ear_keypoints_path, 'rb'))
+
+    # DEBUG : manually pick out frames with bad ear keypoints labels and set to zero
+    bad_ear_keypoints = np.array([5,6,11,12,13,19,26,29,32,34,35,36,37,47,55,61,68,93,119])
 
     # keypoint format [ w, h, c]
 
@@ -574,7 +494,7 @@ if __name__ == "__main__":
                 ref_rightear_keypoints_score[iter, :, :] = torch.zeros([rightear_keypoints_total, 1])
                 pass 
 
-            iter+=1
+            iter += 1
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -584,6 +504,20 @@ if __name__ == "__main__":
             break
         print('%d' % frame_num, end="\r")
     print("")
+
+    ref_leftear_keypoints_score[ bad_ear_keypoints,:, :] = 0
+    ref_rightear_keypoints_score[bad_ear_keypoints,:, :] = 0
+
+    ref_face_keypoints = ref_face_keypoints.to(device) 
+    ref_face_keypoints_side = ref_face_keypoints_side.to(device) 
+    ref_face_keypoints_score = ref_face_keypoints_score.to(device)
+    ref_face_keypoints_side_score = ref_face_keypoints_side_score.to(device)
+
+    ref_leftear_keypoints = ref_leftear_keypoints.to(device) 
+    ref_leftear_keypoints_score = ref_leftear_keypoints_score.to(device)
+
+    ref_rightear_keypoints = ref_rightear_keypoints.to(device) 
+    ref_rightear_keypoints_score = ref_rightear_keypoints_score.to(device) 
 
     model, R, T, param = fit_point(
         data, 
@@ -611,6 +545,8 @@ if __name__ == "__main__":
 
     _,_,_,_,_,_,R,T,k,leftear_k,rightear_k,_,_= model()
     k = k.detach().long().cpu().numpy()
+    leftear_k = leftear_k.detach().long().cpu().numpy()
+    rightear_k = rightear_k.detach().long().cpu().numpy()
     R = R.detach()
     T = T.detach()
     
@@ -634,25 +570,76 @@ if __name__ == "__main__":
     ref_rightear_keypoints = ref_rightear_keypoints.long().cpu().numpy()
 
     ref_depth = ref_depth.cpu().numpy()
-    from IPython import embed;embed()
+
+    im_h_list = []
+
+    gt_color = (255,0,0)
+    pred_color = (0,0,255)
+
+    # cv2.circle radius : int
+    face_kp_size = 3
+    ear_kp_size = 1
+
     for i in range(frame_total):
         gt_k = mask[i,:,:,None].broadcast_to((height,width,3)).cpu().numpy()*255
         
-        kk = np.zeros((height,width,3))
-        kk[k[i, :, 1], k[i, :, 0], :] = 255
+        #kk = np.zeros((height,width,3))
+        #kk[k[i, :, 1], k[i, :, 0], :] = 255
 
         points = torch.bmm(verts, R[i:i+1]) + torch.broadcast_to(T[i:i+1].unsqueeze(1), (1, verts.shape[1], 3))
         mesh, z = render_mesh(verts=points.detach(),faces=data['face'] , rgb=None)
         mesh *= 255
-        
+       
+        # draw face keypoints 
         for j in range(face_keypoints_total - side_face_keypoints_total):
-            video[i] = cv2.circle(video[i], (ref_face_keypoints[i,j,0], ref_face_keypoints[i,j,1]), 3, (255, 0, 0), -1)
+            video[i] = cv2.circle(video[i], (ref_face_keypoints[i,j,0], ref_face_keypoints[i,j,1]), face_kp_size, gt_color, -1)
             
         for j in range(side_face_keypoints_total):
-            video[i] = cv2.circle(video[i], (ref_face_keypoints_side[i,j,0], ref_face_keypoints_side[i,j,1]), 3, (255, 0, 0), -1)
+            video[i] = cv2.circle(video[i], (ref_face_keypoints_side[i,j,0], ref_face_keypoints_side[i,j,1]), face_kp_size, gt_color, -1)
             
-        for j in range(face_keypoitns_total):
-            video[i] = cv2.circle(video[i], (k[i,j,0], k[i,j,1]), 3, (0, 0, 255), -1)
+        for j in range(face_keypoints_total):
+            if k[i,j,0] < 0 or k[i,j,0] > width:
+                print("out of picture! ", "frame_num=%d"%i, "keypoints num=%d"%j, k[i,j,0])
+                continue
+            
+            if k[i,j,1] < 0 or k[i,j,1] > height:
+                print("out of picture! ", "frame_num=%d"%i, "keypoints num=%d"%j, k[i,j,1])
+                continue
+
+            video[i] = cv2.circle(video[i], (k[i,j,0], k[i,j,1]), face_kp_size, pred_color, -1)
+
+        # draw left ear keypoints
+        for j in range(leftear_keypoints_total):
+            if ref_leftear_keypoints_score[i,j,0]>0:
+                video[i] = cv2.circle(video[i], (ref_leftear_keypoints[i,j,0], ref_leftear_keypoints[i,j,1]), ear_kp_size, gt_color, -1)
+
+        for j in range(leftear_keypoints_total):
+            if leftear_k[i,j,0] < 0 or leftear_k[i,j,0] > width:
+                print("out of picture! ", "frame_num=%d"%i, "keypoints num=%d"%j, k[i,j,0])
+                continue
+            
+            if leftear_k[i,j,1] < 0 or leftear_k[i,j,1] > height:
+                print("out of picture! ", "frame_num=%d"%i, "keypoints num=%d"%j, k[i,j,1])
+                continue
+
+            video[i] = cv2.circle(video[i], (leftear_k[i,j,0], leftear_k[i,j,1]), ear_kp_size, pred_color, -1)
+
+        # draw right ear keypoints
+
+        for j in range(rightear_keypoints_total):
+            if ref_rightear_keypoints[i,j,0] > 0:
+                video[i] = cv2.circle(video[i], (ref_rightear_keypoints[i,j,0], ref_rightear_keypoints[i,j,1]), ear_kp_size, gt_color, -1)
+
+        for j in range(rightear_keypoints_total):
+            if rightear_k[i,j,0] < 0 or rightear_k[i,j,0] > width:
+                print("out of picture! ", "frame_num=%d"%i, "keypoints num=%d"%j, k[i,j,0])
+                continue
+            
+            if rightear_k[i,j,1] < 0 or rightear_k[i,j,1] > height:
+                print("out of picture! ", "frame_num=%d"%i, "keypoints num=%d"%j, k[i,j,1])
+                continue
+
+            video[i] = cv2.circle(video[i], (rightear_k[i,j,0], rightear_k[i,j,1]), ear_kp_size, pred_color, -1)
         
         z[0] = z[0].clip(100.0, 450.0)
         depth_i = cv2.applyColorMap((z[0]/450*255).astype('uint8'), cv2.COLORMAP_JET)#.transpose(1,0,2)
@@ -662,9 +649,20 @@ if __name__ == "__main__":
         dif_depth = cv2.applyColorMap((dif_depth/100*255).astype('uint8'), cv2.COLORMAP_JET)
         
         im_h = cv2.hconcat([video[i].astype('uint8'),mesh.astype('uint8'), depth_i.astype('uint8'), ref_depth_i.astype('uint8'), dif_depth.astype('uint8')])
+        im_h_list.append(im_h)
         out.write(im_h)
-
     out.release()
     cap.release()
+
+    '''
+    # DEBUG : write each frame to image
+    frame_dir = "data/tmp"
+    if not path.isdir(frame_dir):
+        os.mkdir(frame_dir)
+
+    for e,im_h in enumerate(im_h_list):
+        cv2.imwrite(path.join(frame_dir, "debug_ear_%d.png"%e), im_h)
+    '''
+
     cv2.destroyAllWindows()
     
