@@ -4,6 +4,7 @@ import os
 import sys
 import argparse
 import torch
+import pickle as pkl
 
 from RobustVideoMatting.model import MattingNetwork
 
@@ -43,6 +44,8 @@ def segment(in_vid_path):
     bgr = torch.tensor([.47, 1, .6]).view(3,1,1).cuda()
     rec=[None]*4
     downsample_ratio = 0.25
+
+    contour_list = []
 
     with torch.no_grad():
         for frm_idx in range(1200):
@@ -85,6 +88,8 @@ def segment(in_vid_path):
                     return None
                 else:
                     contour = contours[cur_idx].squeeze(axis=1)
+                
+                contour_list.append(contour)
 
                 img_cont = np.copy(img)
                 for pt_id in range(contour.shape[0]):
@@ -106,9 +111,12 @@ def segment(in_vid_path):
                 #     break
                 print("Segment frame [%d/%d]" % (frm_idx + 1, in_vid_frm_num), end="\r")
         print("")
+    return contour_list
 
 if __name__ == "__main__":
     video_path = "data/rgb.mov"
     if len(sys.argv) > 1:
         video_path = sys.argv[1]
-    segment(video_path)
+    contour_list = segment(video_path)
+
+    pkl.dump(contour_list, open("data/contour.pkl", 'wb'))

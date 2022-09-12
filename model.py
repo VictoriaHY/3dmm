@@ -1,7 +1,9 @@
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch3d
+from tqdm import tqdm
 
 from pytorch3d.io import load_obj
 
@@ -22,37 +24,25 @@ import math
 class Model(nn.Module):
     def __init__(
         self, 
-        mean, 
-        pca, 
-        variance, 
+        mm_model, 
         renderer, 
 
-        face_keypoints_indices, 
-        ref_face_keypoints, 
-        ref_face_keypoints_score, 
-        ref_face_keypoints_side, 
-        ref_face_keypoints_side_score, 
-
-        leftear_keypoints_indices=None,
-        ref_leftear_keypoints=None,
-        ref_leftear_keypoints_score=None,
-
-        rightear_keypoints_indices=None,
-        ref_rightear_keypoints=None,
-        ref_rightear_keypoints_score=None,
+        keypoints_dict,
         
         image_size=None,
         device=None,
         frame_total=None, 
-        ref_depth=None
-        ):
+        ref_depth=None,
+        ref_contour=None):
         super().__init__()
 
-        self.mean = mean
-        self.pca = pca
-        self.variance = variance
-        self.face_keypoints_indices = face_keypoints_indices
+        self.mean = mm_model["mean"]
+        self.pca = mm_model["pca"]
+        self.variance = mm_model["variance"]
+
+        self.face_keypoints_indices = keypoints_dict["indice"]["face"]
         self.ref_depth = ref_depth
+        self.ref_contour = ref_contour
         
         self.inner = torch.tensor([8, 17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67])
         self.side = torch.tensor([0,1,2,3,4,5,6,7, 9,10,11,12,13,14,15,16])
@@ -62,18 +52,18 @@ class Model(nn.Module):
         self.device = device
         self.renderer = renderer
         
-        self.ref_face_keypoints = ref_face_keypoints
-        self.ref_face_keypoints_side = ref_face_keypoints_side
-        self.ref_face_keypoints_score = ref_face_keypoints_score
-        self.ref_face_keypoints_side_score = ref_face_keypoints_side_score
+        self.ref_face_keypoints_inner = keypoints_dict["keypoints"]["face_inner"]
+        self.ref_face_keypoints_side = keypoints_dict["keypoints"]["face_side"]
+        self.ref_face_keypoints_inner_score = keypoints_dict["score"]["face_inner"]
+        self.ref_face_keypoints_side_score = keypoints_dict["score"]["face_side"]
 
-        self.leftear_keypoints_indices=leftear_keypoints_indices
-        self.ref_leftear_keypoints=ref_leftear_keypoints
-        self.ref_leftear_keypoints_score=ref_leftear_keypoints_score
+        self.leftear_keypoints_indices = keypoints_dict["indice"]["leftear"]
+        self.ref_leftear_keypoints = keypoints_dict["keypoints"]["leftear"]
+        self.ref_leftear_keypoints_score = keypoints_dict["score"]["leftear"]
 
-        self.rightear_keypoints_indices=rightear_keypoints_indices
-        self.ref_rightear_keypoints=ref_rightear_keypoints
-        self.ref_rightear_keypoints_score=ref_rightear_keypoints_score
+        self.rightear_keypoints_indices = keypoints_dict["indice"]["rightear"]
+        self.ref_rightear_keypoints = keypoints_dict["keypoints"]["rightear"]
+        self.ref_rightear_keypoints_score = keypoints_dict["score"]["rightear"]
         
         R = torch.zeros((frame_total, 3), dtype=torch.float32, device=self.device)
         R[:,2] = np.pi
@@ -98,15 +88,21 @@ class Model(nn.Module):
         self.p_matrix = torch.tensor(p_matrix, device=self.device)
         self.reverse_z = torch.tensor(reverse_z, device=self.device)
 
-        # self.num = 53149
-        self.num = 11510
+        # self.vertex_total = 53149
+        self.vertex_total = 11510
 
-        self.face_keypoints_total = face_keypoints_indices.shape[0]
-        self.leftear_keypoints_total = leftear_keypoints_indices.shape[0]
-        self.rightear_keypoints_total = rightear_keypoints_indices.shape[0]
-        
+        self.face_keypoints_total = self.face_keypoints_indices.shape[0]
+        self.leftear_keypoints_total = self.leftear_keypoints_indices.shape[0]
+        self.rightear_keypoints_total = self.rightear_keypoints_indices.shape[0]
+       
+        # [ B x H x W x 2] 
         self.corresp = torch.ones((frame_total, image_size[0], image_size[1], 2), device=self.device)
         self.m = (self.corresp>0)
+
+        # [ B x H x W ]
+        #self.vertex_image = torch.ones((frame_total, image_size[0], image_size[1]), device=self.device)
+        # [ H x W ]
+        self.image_size = image_size
 
     @staticmethod
     def Compute_rotation_matrix(angles):
@@ -179,7 +175,7 @@ class Model(nn.Module):
         rightear_kp = self.project(rightear_kp, self.batchsize)
         rightear_kp = rightear_kp[:, :, :2]
 
-        kp_loss_face_inner = torch.mean(((face_kp[:, self.inner, :] - self.ref_face_keypoints) ** 2) * self.ref_face_keypoints_score)
+        kp_loss_face_inner = torch.mean(((face_kp[:, self.inner, :] - self.ref_face_keypoints_inner) ** 2) * self.ref_face_keypoints_inner_score)
         kp_loss_face_side = torch.mean(((face_kp[:, self.side, :] - self.ref_face_keypoints_side) ** 2) * self.ref_face_keypoints_side_score)
 
         kp_loss_leftear = torch.mean(((leftear_kp - self.ref_leftear_keypoints) ** 2) * self.ref_leftear_keypoints_score)
@@ -191,26 +187,72 @@ class Model(nn.Module):
         mask=None
         pred_d = None
 
+        loss_seg = 0
+
+        mesh_seg_list = [torch.empty([0,0])] * (b2-b1)
         if b2>0:
             
-            points = torch.bmm(torch.broadcast_to(points, (b2-b1,self.num, 3)), R1[b1:b2,:,:]) + torch.broadcast_to(T1[b1:b2,:].unsqueeze(1), (b2-b1,self.num, 3))
+            points = torch.bmm(torch.broadcast_to(points, (b2-b1,self.vertex_total, 3)), R1[b1:b2,:,:]) + torch.broadcast_to(T1[b1:b2,:].unsqueeze(1), (b2-b1,self.vertex_total, 3))
             points1 = self.project(points, b2-b1)
 
-            m0 = ((points1[:,:,1]>=0) & (points1[:,:,1]<=640-1)) & ((points1[:,:,0]>=0) & (points1[:,:,0]<=360-1))
+            m0 = ((points1[:,:,1]>=0) & (points1[:,:,1]<self.image_size[0])) & ((points1[:,:,0]>=0) & (points1[:,:,0]<self.image_size[1]))
             m0 = m0[:,:,None].detach()
             points1 = points1 * m0
             
-            
             if update:
                 self.corresp[:,:,:,1] = 1       
-                for i in range(b1, b2):
-                    for j in range(self.num):
-                        self.corresp[i, points1[i-b1,j,1].long(), points1[i-b1,j,0].long(),1] = j/(self.num-1)*2-1
+                for i in tqdm(range(b1, b2)):
+                    for j in range(self.vertex_total):
+                        self.corresp[i, points1[i-b1,j,1].long(), points1[i-b1,j,0].long(),1] = j/(self.vertex_total)*2-1
                 self.corresp.detach()
                 
+                print("calculating correspondence end")
+            '''
+            #has_vertex = (self.corresp[:,:,:,1]>=-1) & (self.corresp[:,:,:,1]<1)
+            has_vertex = (self.corresp[:,:,:,1]>-1)
+            has_vertex = has_vertex.float().cpu().numpy()
+            #from IPython import embed;embed()
+
+            sobel_kernel_size = 3
+
+            edges = cv2.Sobel(has_vertex, ddepth=cv2.CV_32F, dx=1, dy=1, ksize=sobel_kernel_size)
+
+            B,H,W = np.where(edges!=0)
+            B = torch.tensor(B)
+            H = torch.tensor(H) 
+            W = torch.tensor(W) 
+            
+            mesh_seg_list = []
+            for i in range(b1, b2):
+                bind = torch.where(B == i)
+                # [ M x 2 ]
+                mesh_seg = torch.stack((W[bind], H[bind]), dim=1) 
+                mesh_seg_list.append(mesh_seg)
+
+            H = H / self.image_size[0]
+            W = W / self.image_size[1]
+
+            for i in range(b1, b2):
+                bind = torch.where(B == i)
+                # [ M x 2 ]
+                mesh_seg = torch.stack((W[bind], H[bind]), dim=1) 
+                ref_seg = torch.tensor(self.ref_contour[i]).long()
+
+                M = mesh_seg.shape[0]
+                N = ref_seg.shape[0]
+                
+                # [M x N x 2]
+                mesh_seg_rep = mesh_seg.repeat([N,1,1]).transpose(0,1)
+                ref_seg_rep = ref_seg.repeat([M,1,1])
+                dis = ((mesh_seg_rep - ref_seg_rep) ** 2).sum(dim=2).min(dim=1).values.sum()
+                print(i, dis)
+                loss_seg += dis
+
+            self.corresp = self.corresp/(self.vertex_total-1)*2-1
+            '''
             self.m = (self.corresp>=-1) & (self.corresp<1)
             
-            points[:,self.num-1,2]=0
+            points[:,self.vertex_total-1,2]=0
             pred_d = F.grid_sample(points[:,None,:,:], self.corresp[b1:b2, :,:,:], mode='nearest', align_corners=True)
             
             pred_d = pred_d#*self.m[b1:b2,None, : , :, 1]
@@ -223,19 +265,26 @@ class Model(nn.Module):
             mask = mask.detach()
             
             loss_d1 = torch.nn.HuberLoss(delta=math.sqrt(d)/2)(pred_d[mask], ref[mask])
-            
-        return (
-            kp_loss_face_inner,
-            kp_loss_face_side, 
-            kp_loss_leftear, 
-            kp_loss_rightear, 
-            loss_reg, 
-            loss_d1, 
-            R1, 
-            T1, 
-            face_kp, 
-            leftear_kp, 
-            rightear_kp, 
-            mask, 
-            pred_d
-            )
+           
+        loss_kp = {
+            "face_inner": kp_loss_face_inner,
+            "face_side": kp_loss_face_side,
+            "leftear": kp_loss_leftear,
+            "rightear": kp_loss_rightear} 
+
+        loss = {
+            "keypoints": loss_kp,
+            "reg": loss_reg,
+            "depth": loss_d1,
+            "segmentation": loss_seg
+            }
+
+        transformation = {"R":R1, "T": T1}
+        keypoints = {
+            "face": face_kp,
+            "leftear": leftear_kp,
+            "rightear": rightear_kp
+            }
+
+        return loss, transformation, keypoints, mask, pred_d, mesh_seg_list
+

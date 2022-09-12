@@ -61,6 +61,7 @@ rightear_keypoints_mapping_path = "face_warehouse/right_ear.txt"
 
 face_keypoints_dir = "data/face_keypoints"
 ear_keypoints_path = "data/ear_keypoints_prediction.pkl"
+contour_path = "data/contour.pkl"
 
 w = 640
 h = 360
@@ -165,27 +166,18 @@ def render_mesh(
     return rend[0], z.cpu().numpy()
 
 epoch_1 = 4000
-#epoch_1 = 200
 epoch_2 = 2000
 #epoch_2 = 200
 def fit_point(
     data=None, 
-    face_keypoints_indices=None, 
-    ref_face_keypoints=None, 
-    ref_face_keypoints_side=None, 
-    ref_face_keypoints_score=None, 
-    ref_face_keypoints_side_score=None, 
-    leftear_keypoints_indices=None,
-    ref_leftear_keypoints=None,
-    ref_leftear_keypoints_score=None,
-    rightear_keypoints_indices=None,
-    ref_rightear_keypoints=None,
-    ref_rightear_keypoints_score=None,
+    keypoints_dict = None,
+    
     image_size=(640,360),
     background_color=(0, 0, 0),
     device=None,
     frame_total = 0,
-    ref_depth=None
+    ref_depth=None,
+    ref_contour=None
 ):
     if device is None:
         device = get_device()
@@ -196,30 +188,21 @@ def fit_point(
     pca_shape = torch.tensor(data['shape_pcaBasis'], dtype=torch.float32).to(device)
     variance_shape = torch.tensor(data['shape_pcaVariance'], dtype=torch.float32).to(device)
 
+    mm_model = {
+        "mean" : mean_shape,
+        "pca" : pca_shape,
+        "variance" : variance_shape}
+
     model = Model(
-        mean = mean_shape, 
-        pca = pca_shape, 
-        variance = variance_shape, 
+        mm_model = mm_model, 
         renderer = renderer, 
-
-        face_keypoints_indices=face_keypoints_indices, 
-        ref_face_keypoints=ref_face_keypoints, 
-        ref_face_keypoints_side=ref_face_keypoints_side, 
-        ref_face_keypoints_score=ref_face_keypoints_score, 
-        ref_face_keypoints_side_score=ref_face_keypoints_side_score, 
-
-        leftear_keypoints_indices=leftear_keypoints_indices,
-        ref_leftear_keypoints=ref_leftear_keypoints,
-        ref_leftear_keypoints_score=ref_leftear_keypoints_score,
-
-        rightear_keypoints_indices=rightear_keypoints_indices,
-        ref_rightear_keypoints=ref_rightear_keypoints,
-        ref_rightear_keypoints_score=ref_rightear_keypoints_score,
+        keypoints_dict = keypoints_dict,
        
         image_size=image_size, 
         device=device,
         frame_total=frame_total, 
-        ref_depth=ref_depth)
+        ref_depth=ref_depth,
+        ref_contour=ref_contour)
     model = model.to(device)
 
     optimizer = torch.optim.Adam([model.R, model.T], lr=0.1)
@@ -233,6 +216,7 @@ def fit_point(
     epoch = tqdm(range(epoch_1))
     R=None
     T=None
+
     print('stage 1')
     for i in epoch:
         flag=False
@@ -240,28 +224,31 @@ def fit_point(
             flag=True
         if i<4000:
             optimizer.zero_grad()
-            loss, loss1, leftear_loss, rightear_loss, reg_loss, loss_d, R, T, key, leftear_kp, rightear_kp, _, _ = model()
-            #l = loss + 0.1*loss1
-            l = loss + leftear_loss + rightear_loss + 0.1*loss1
+
+            loss, transformation, keypoints, mask, pred_d, mesh_seg_list = model()
+            l = loss["keypoints"]['face_inner'] + loss["keypoints"]['leftear'] + loss["keypoints"]['rightear'] + 0.1 * loss["keypoints"]['face_side']
+
             l.backward()
             optimizer.step()
         else:
-            loss, loss1, leftear_loss, rightear_loss, reg_loss, loss_d, R, T, key, leftear_kp, rightear_kp, m, _ = model(d=900, b1=0, b2=120, update=flag)
-            #l = loss + 0.1*loss1 +loss_d/50
-            l = loss + leftear_loss + rightear_loss + 0.1*loss1 +loss_d/50
+            #loss, loss1, leftear_loss, rightear_loss, reg_loss, loss_d, loss_seg, R, T, key, leftear_kp, rightear_kp, m, _ ,mesh_seg_list = model(d=900, b1=0, b2=120, update=flag)
+            #l = loss + leftear_loss + rightear_loss + 0.1*loss1 +loss_d/50
+            
+            loss, transformation, keypoints, mask, pred_d, mesh_seg_list = model(d=900, b1=0, b2=120, update=flag)
+            l = loss["keypoints"]['face_inner'] + loss["keypoints"]['leftear'] + loss["keypoints"]['rightear'] + 0.1 * loss["keypoints"]['face_side'] + 0.02 * loss["depth"]
 
             l.backward()
             optimizer.step()
         
         if i<4000 and i%1000==0:
-            print('Optimizing (reg loss %.4f, loss %.4f)' % (reg_loss.data, loss.data))
+            print('Optimizing (reg loss %.4f, keypoints inner face loss %.4f)' % (loss["reg"].data, loss['keypoints']['face_inner'].data))
         elif i%100==0 and i>=4000:
-            print('epoch %d, Optimizing (reg loss %.4f, keypoint loss %.4f, depth loss %.4f)' % (i, reg_loss.data, loss.data, loss_d.data))
-            print(m.sum())
-            print(m.sum(dim=(1,2)))
+            print('epoch %d, Optimizing (reg loss %.4f, keypoints inner face loss %.4f, depth loss %.4f)' % (i, loss["reg"].data, loss["keypoints"]["face_inner"].data, loss["depth"].data))
+            print(mask.sum())
+            print(mask.sum(dim=(1,2)))
 
         if USE_WANDB and i%1000==0:
-            wandb.log({'epoch': i, 'train/loss': loss.data})
+            wandb.log({'epoch': i, 'train/loss': loss["keypoints"]["face_inner"].data})
 
     epoch = tqdm(range(epoch_2))
     optimizer = torch.optim.Adam([model.R, model.T, model.param], lr=0.01)
@@ -275,24 +262,27 @@ def fit_point(
         optimizer.zero_grad()
         if i>=1000 and i<1500:
             for batch in range(0, frame_total, 120):
-                loss, loss1, leftear_loss, rightear_loss, reg_loss, loss_d, R, T, key, leftear_kp, rightear_kp, m, _ = model(d=900, b1=batch, b2=min(batch+120, frame_total), update=flag)
-                #l = 0.3*loss+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
-                l = 0.3* ( loss + leftear_loss + rightear_loss)+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
+
+                loss, transformation, keypoints, mask, pred_d, mesh_seg_list = model(d=900, b1=batch, b2=min(batch+120, frame_total), update=flag)
+                l = 0.3 * (loss["keypoints"]['face_inner'] + loss["keypoints"]['leftear'] + loss["keypoints"]['rightear'] + 0.5 * loss["keypoints"]['face_side']) + 5 * loss["reg"] + 0.3 * loss["depth"]
+
                 l.backward()
                 optimizer.step()
         elif i>=1500 and i<2100:
             for batch in range(0, frame_total, 120):
-                loss, loss1, leftear_loss, rightear_loss, reg_loss, loss_d, R, T, key, leftear_kp, rightear_kp, m, _= model(d=400, b1=batch, b2=min(batch+120, frame_total), update=flag)
-                #l = 0.3*loss+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
-                l = 0.3* ( loss + leftear_loss + rightear_loss )+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
+
+                loss, transformation, keypoints, mask, pred_d, mesh_seg_list = model(d=400, b1=batch, b2=min(batch+120, frame_total), update=flag)
+                l = 0.3 * (loss["keypoints"]['face_inner'] + loss["keypoints"]['leftear'] + loss["keypoints"]['rightear'] + 0.5 * loss["keypoints"]['face_side']) + 5 * loss["reg"] + 0.3 * loss["depth"]
+
                 l.backward()
                 optimizer.step()
         elif i>=2100:
             # if i%2==0 or i%2==1:
             for batch in range(0, frame_total, 120):
-                loss, loss1, leftear_loss, rightear_loss, reg_loss, loss_d, R, T, key, leftear_kp, rightear_kp, m, _= model(d=100, b1=batch, b2=min(batch+120, frame_total), update=flag)
-                #l = 0.3*loss+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
-                l = 0.3* ( loss + leftear_loss + rightear_loss )+ 5*reg_loss + loss_d/3+ 0.3*0.5*loss1
+
+                loss, transformation, keypoints, mask, pred_d, mesh_seg_list = model(d=100, b1=batch, b2=min(batch+120, frame_total), update=flag)
+                l = 0.3 * (loss["keypoints"]['face_inner'] + loss["keypoints"]['leftear'] + loss["keypoints"]['rightear'] + 0.5 * loss["keypoints"]['face_side']) + 5 * loss["reg"] + 0.3 * loss["depth"]
+
                 l.backward()
                 optimizer.step()
             # else:
@@ -301,21 +291,23 @@ def fit_point(
             #     l.backward()
             #     optimizer.step()
         else:
-            loss, loss1, leftear_loss, rightear_loss, reg_loss, loss_d, R, T, key, leftear_kp, rightear_kp, m, _= model()
-            #l = loss+ 5*reg_loss + 0.1*loss1
-            l = loss + leftear_loss + rightear_loss + 5*reg_loss + 0.1*loss1
+
+            loss, transformation, keypoints, mask, pred_d, mesh_seg_list = model()
+
+            l = 1.0 * (loss["keypoints"]['face_inner'] + loss["keypoints"]['leftear'] + loss["keypoints"]['rightear'] + 0.1 * loss["keypoints"]['face_side']) + 5 * loss["reg"]
+
             l.backward()
             optimizer.step()
         
         if i>=1000 and i%100==0:
-            print('epoch %d, Optimizing (reg loss %.4f, keypoint loss %.4f, depth loss %.4f)' % (i, reg_loss.data, loss.data, loss_d.data))
-            print(m.sum())
-            print(m.sum(dim=(1,2)))
+            print('epoch %d, Optimizing (reg loss %.4f, keypoints face inner loss %.4f, depth loss %.4f)' % (i, loss["reg"].data, loss["keypoints"]["face_inner"].data, loss["depth"].data))
+            print(mask.sum())
+            print(mask.sum(dim=(1,2)))
         elif i%500==0 and i<1000:
-            print('epoch %d, Optimizing (reg loss %.4f, keypoint loss %.4f)' % (i, reg_loss.data, loss.data))
+            print('epoch %d, Optimizing (reg loss %.4f, keypoints face inner loss %.4f)' % (i, loss["reg"].data, loss["keypoints"]["face_inner"].data))
 
         if USE_WANDB and i%1000==0:
-            wandb.log({'epoch': i, 'train/loss': loss.data})
+            wandb.log({'epoch': i, 'train/loss': loss["keypoints"]["face_inner"].data})
         
     return model, R, T, model.param 
 
@@ -424,7 +416,7 @@ if __name__ == "__main__":
     # DEBUG : manually pick out frames with bad ear keypoints labels and set to zero
     bad_ear_keypoints = np.array([5,6,11,12,13,19,26,29,32,34,35,36,37,47,55,61,68,93,119])
 
-    # keypoint format [ w, h, c]
+    # keypoint format [ W x H x C]
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -519,32 +511,61 @@ if __name__ == "__main__":
     ref_rightear_keypoints = ref_rightear_keypoints.to(device) 
     ref_rightear_keypoints_score = ref_rightear_keypoints_score.to(device) 
 
+    contour_list = pkl.load(open(contour_path, 'rb'))
+    normalized_contour_list = []
+
+    for ct in contour_list:
+        ct[:, 0] = ct[:, 0]/original_width
+        ct[:, 1] = ct[:, 1]/original_height
+        normalized_contour_list.append(ct)
+  
+    ref_keypoints_indice = {
+        "face" : face_keypoints_indices,
+        "leftear" : leftear_keypoints_indices,
+        "rightear" : rightear_keypoints_indices
+    }
+
+    ref_keypoints = {
+        "face_inner" : ref_face_keypoints,
+        "face_side" : ref_face_keypoints_side,
+        "leftear" : ref_leftear_keypoints,
+        "rightear" : ref_rightear_keypoints
+    }
+
+    ref_keypoints_score = {
+        "face_inner" : ref_face_keypoints_score,
+        "face_side" : ref_face_keypoints_side_score,
+        "leftear" : ref_leftear_keypoints_score,
+        "rightear" : ref_rightear_keypoints_score
+    }
+
+    keypoints_dict = {
+        "indice" : ref_keypoints_indice,
+        "keypoints" : ref_keypoints,
+        "score" : ref_keypoints_score 
+    }
+
     model, R, T, param = fit_point(
         data, 
-        face_keypoints_indices, 
-        ref_face_keypoints=ref_face_keypoints, 
-        ref_face_keypoints_side=ref_face_keypoints_side, 
-        ref_face_keypoints_score=ref_face_keypoints_score, 
-        ref_face_keypoints_side_score=ref_face_keypoints_side_score, 
-
-        leftear_keypoints_indices=leftear_keypoints_indices,
-        ref_leftear_keypoints=ref_leftear_keypoints,
-        ref_leftear_keypoints_score=ref_leftear_keypoints_score,
-
-        rightear_keypoints_indices=rightear_keypoints_indices,
-        ref_rightear_keypoints=ref_rightear_keypoints,
-        ref_rightear_keypoints_score=ref_rightear_keypoints_score,
+        keypoints_dict = keypoints_dict,
 
         device=device,
         image_size= (height, width),
         frame_total=frame_total, 
-        ref_depth = ref_depth
+        ref_depth = ref_depth,
+        ref_contour = normalized_contour_list
     )
-    from IPython import embed;embed()
     # pos = pos.detach()
     param = param.detach()
+    #_,_,_,_,_,_,R,T,k,leftear_k,rightear_k,_,_,mesh_seg_list = model()
+    #loss, transformation, keypoints, m, pred_d, mesh_seg_list = model(d=900, b1=0,b2=120,update=True)
+    loss, transformation, keypoints, m, pred_d, mesh_seg_list = model() 
+    R = transformation["R"]
+    T = transformation["T"]
+    k = keypoints["face"]
+    leftear_k = keypoints["leftear"]
+    rightear_k = keypoints["rightear"]
 
-    _,_,_,_,_,_,R,T,k,leftear_k,rightear_k,_,_= model()
     k = k.detach().long().cpu().numpy()
     leftear_k = leftear_k.detach().long().cpu().numpy()
     rightear_k = rightear_k.detach().long().cpu().numpy()
@@ -641,7 +662,16 @@ if __name__ == "__main__":
                 continue
 
             video[i] = cv2.circle(video[i], (rightear_k[i,j,0], rightear_k[i,j,1]), ear_kp_size, pred_color, -1)
-        
+        '''
+        # draw mesh segment points
+        if len(mesh_seg_list) > 0 :
+            for pt in mesh_seg_list[i]:
+                pt = pt.cpu().numpy()
+                try:
+                    video[i] = cv2.circle(video[i], (pt[0], pt[1]), 2, (0,255,0), -1)
+                except:
+                    print(pt)
+        '''
         z[0] = z[0].clip(100.0, 450.0)
         depth_i = cv2.applyColorMap((z[0]/450*255).astype('uint8'), cv2.COLORMAP_JET)#.transpose(1,0,2)
         
