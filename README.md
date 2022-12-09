@@ -1,7 +1,5 @@
 ## Capstone Project
 
-##### Yu Han and Wenyu Xia
-
 Our goal is to utilize RGB-D video from selfie camera to reconstruct 3D digital human heads.
 
 This part of code is to utilize 3DMM to reconstruct human heads.
